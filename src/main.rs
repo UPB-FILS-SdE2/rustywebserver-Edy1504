@@ -1,4 +1,4 @@
-use std::env;
+/*use std::env;
 use std::fs;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
@@ -116,4 +116,127 @@ fn main(){
         }
     }
 
+}*/
+mod runner;
+
+use std::env;
+use std::error::Error;
+use std::ffi::c_int;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::mem;
+use std::os::raw::c_void;
+
+use nix::libc::{Elf32_Ehdr, Elf32_Phdr, siginfo_t, AT_ENTRY, AT_PHDR};
+use nix::sys::mman::{mmap, munmap, mprotect, MapFlags, ProtFlags};
+use nix::sys::signal::{sigaction, SigAction, SigHandler, SaFlags, SigSet, Signal};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use lazy_static::lazy_static;
+use std::num::NonZeroUsize;
+
+lazy_static! {
+    static ref SEGMENTS: Mutex<HashMap<usize, (usize, usize, u32)>> = Mutex::new(HashMap::new());
+}
+
+fn read_elf_header(file: &mut File) -> Result<Elf32_Ehdr, Box<dyn Error>> {
+    let mut ehdr: Elf32_Ehdr = unsafe { std::mem::zeroed() };
+    file.seek(SeekFrom::Start(0))?;
+    let ehdr_slice = unsafe { std::slice::from_raw_parts_mut(&mut ehdr as *mut _ as *mut u8, mem::size_of::<Elf32_Ehdr>()) };
+    file.read_exact(ehdr_slice)?;
+    Ok(ehdr)
+}
+
+fn read_program_headers(file: &mut File, ehdr: &Elf32_Ehdr) -> Result<Vec<Elf32_Phdr>, Box<dyn Error>> {
+    let mut phdrs = vec![unsafe { std::mem::zeroed() }; ehdr.e_phnum as usize];
+    file.seek(SeekFrom::Start(ehdr.e_phoff as u64))?;
+    let phdr_slice = unsafe { std::slice::from_raw_parts_mut(phdrs.as_mut_ptr() as *mut u8, (ehdr.e_phnum as usize * mem::size_of::<Elf32_Phdr>())) };
+    file.read_exact(phdr_slice)?;
+    Ok(phdrs)
+}
+
+fn display_segments(phdrs: &[Elf32_Phdr]) {
+    eprintln!("Segments");
+    eprintln!("#\taddress\t\tsize\toffset\tlength\tflags");
+    for (i, phdr) in phdrs.iter().enumerate() {
+        let flags = format!(
+            "{}{}{}",
+            if phdr.p_flags & 0x1 != 0 { "x" } else { "-" },
+            if phdr.p_flags & 0x2 != 0 { "w" } else { "-" },
+            if phdr.p_flags & 0x4 != 0 { "r" } else { "-" },
+        );
+        eprintln!(
+            "{}\t0x{:x}\t{}\t0x{:x}\t{}\t{}",
+            i, phdr.p_vaddr, phdr.p_memsz, phdr.p_offset, phdr.p_filesz, flags
+        );
+    }
+}
+
+unsafe extern "C" fn sigsegv_handler(_signal: c_int, siginfo: *mut siginfo_t, _extra: *mut c_void) {
+    let faulting_address = (*siginfo).si_addr() as usize;
+    let segments = SEGMENTS.lock().unwrap();
+
+    for (start, &(end, offset, flags)) in segments.iter() {
+        if faulting_address >= *start && faulting_address < *start + end {
+            let page_size = 4096; // Assuming page size of 4096 bytes
+            let page_start = faulting_address & !(page_size - 1);
+
+            if let Ok(_) = mmap(
+                NonZeroUsize::new(page_start as usize),
+                NonZeroUsize::new(page_size).expect("REASON"),
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                offset as c_int,
+                page_start as i64 - *start as i64,
+            ) {
+                mprotect(
+                    page_start as *mut c_void,
+                    page_size,
+                    ProtFlags::from_bits(flags.try_into().unwrap()).unwrap(),
+                )
+                .unwrap(); // You should handle errors more gracefully
+                return;
+            }
+        }
+    }
+
+    eprintln!("Error: Unauthorized memory access at {:x}", faulting_address);
+    std::process::exit(-200);
+}
+
+fn exec(filename: &str) -> Result<(), Box<dyn Error>> {
+    let mut file = File::open(filename)?;
+    let ehdr = read_elf_header(&mut file)?;
+    let phdrs = read_program_headers(&mut file, &ehdr)?;
+
+    display_segments(&phdrs);
+
+    let base_address = phdrs.iter().map(|phdr| phdr.p_vaddr).min().unwrap_or(0);
+    eprintln!("Base address 0x{:x}", base_address);
+    eprintln!("Entry point 0x{:x}", ehdr.e_entry);
+
+    let mut segments = HashMap::new();
+    for phdr in &phdrs {
+        segments.insert(
+            phdr.p_vaddr as usize,
+            (phdr.p_memsz as usize, phdr.p_offset as usize, phdr.p_flags),
+        );
+    }
+    SEGMENTS.lock().unwrap().extend(segments);
+
+    let env_address = 0; // Replace with actual logic to get env address
+
+    runner::exec_run(base_address as usize, ehdr.e_entry as usize, env_address as usize);
+
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <executable>", args[0]);
+        std::process::exit(1);
+    }
+    exec(&args[1])
 }
